@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "CUDA/cuDNN of PLATO — the vibe field as a first-class compute primitive"
 license = "MIT"
+repository = "https://github.com/SuperInstance/lau-vibe-field"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
