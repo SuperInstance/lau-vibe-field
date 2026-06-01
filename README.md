@@ -1,16 +1,41 @@
 # lau-vibe-field
 
-A scalar tensor field over 2D space. What a tensor is to PyTorch, a vibe field is to PLATO.
+**CUDA/cuDNN of PLATO — the vibe field as a first-class compute primitive.**
 
-This is the compute primitive: a flat `Vec<f64>` buffer with SIMD-friendly layout, conservation enforcement, and field operations (diffuse, advect, gradient, laplacian). GPU-ready.
+What a tensor is to PyTorch, a vibe field is to PLATO. A scalar field `f64` over 2D space with conservation enforcement, diffusion, advection, gradient/Laplacian computation, local extrema detection, bilinear interpolation, and resampling. Flat buffer with SIMD-friendly layout, ready for GPU offload.
 
-## The concept in 60 seconds
+---
 
-A vibe field is a 2D grid of `f64` values. You **deposit** energy, it spreads via **diffusion**, moves via **advection**, and you sample it with **gradient** queries. Total energy is tracked — every deposit and withdraw is balanced.
+## What This Does
 
-The field is deliberately minimal. No rendering, no UI, no opinions about what the values *mean*. It's a physics-grade scalar field you can build anything on top of.
+`lau-vibe-field` provides the core spatial data structure for the Lau platform. A **vibe field** is a 2D grid of `f64` values representing energy, attention, emotion, or any continuous scalar quantity distributed across space. The library enforces **strict energy conservation** (deposits and withdrawals are atomic, total energy is tracked incrementally) and provides PDE-level operations: diffusion (heat equation), semi-Lagrangian advection, gradient/Laplacian computation, and divergence.
 
-## Quick start
+Multiple fields are managed by a `VibeFieldEngine` that ticks them forward together, and `VibeFieldPair` enables conservation-preserving energy transfers between two fields.
+
+---
+
+## Key Idea
+
+A vibe field is just a flat `Vec<f64>` with width × height, but the invariant is what matters: **every operation preserves or explicitly tracks total energy**. You can deposit, withdraw, diffuse, advect, and resample — and at any point, `total_energy` is the exact sum of all cells. This makes it safe to use as a budgeting mechanism: rooms share a global energy budget, and no room can spend more than the system allows.
+
+---
+
+## Install
+
+```toml
+[dependencies]
+lau-vibe-field = "0.1.0"
+```
+
+```bash
+cargo add lau-vibe-field
+```
+
+Requires Rust 2021 edition. Only external dependency: `serde` (with `derive`).
+
+---
+
+## Quick Start
 
 ```rust
 use lau_vibe_field::*;
@@ -18,79 +43,230 @@ use lau_vibe_field::*;
 // Create a 64×64 field
 let mut field = VibeField::new(64, 64, 1.0);
 
-// Deposit energy at a point
+// Deposit energy at the center
 field.deposit(32, 32, 100.0);
-assert_eq!(field.total_energy(), 100.0);
 
-// Diffuse — energy spreads to neighbors
-field.diffuse(0.1);
+// Compute gradient and Laplacian
+let (gx, gy) = field.gradient(32, 32);
+let lap = field.laplacian(32, 32);
 
-// Sample the gradient at a point
-let (dx, dy) = field.gradient(33, 32);
-println!("Energy flows toward ({}, {})", dx, dy);
+// Diffuse for 10 steps (heat equation, rate 0.1)
+for _ in 0..10 {
+    field.diffuse(0.1);
+}
 
-// Withdraw energy
-field.withdraw(32, 32, 10.0);
+// Energy is approximately conserved through diffusion
+assert!((field.total_energy() - 100.0).abs() < 5.0);
 
-// Conservation check
-assert!(field.is_conserved(90.0, 0.01));
+// Find where the energy peaks are
+let maxima = field.local_maxima();
+
+// Take a snapshot for rendering
+let snapshot = field.snapshot();
+
+// Get statistics
+let stats = field.field_stats();
+println!("Energy: {}, Entropy: {:.3}", stats.total_energy, stats.entropy);
 ```
 
-## Field operations
+### Multi-field Engine
 
 ```rust
-field.deposit(x, y, amount);           // Add energy at a point
-field.withdraw(x, y, amount);          // Remove energy at a point
-field.diffuse(rate);                    // Spread energy to neighbors
-field.advect(&vx, &vy, dt);           // Move energy along velocity fields
-field.gradient(x, y);                  // → (df/dx, df/dy)
-field.laplacian(x, y);                 // → ∇²f (curvature)
-field.divergence(x, y);               // → ∇·F
-field.normalize();                     // Scale total energy to 1.0
+let mut engine = VibeFieldEngine::new(0.1);
+engine.create_field("attention", 64, 64, 1.0);
+engine.create_field("emotion", 64, 64, 1.0);
+
+engine.deposit("attention", 32, 32, 50.0);
+engine.deposit("emotion", 10, 10, 30.0);
+
+engine.tick(); // diffuses all fields
+engine.tick();
+
+let stats = engine.engine_stats();
+// EngineStats { field_count: 2, total_energy: 80.0, tick: 2 }
 ```
 
-## Key types
-
-| Type | What it does |
-|------|-------------|
-| `VibeField` | The core field: 2D grid + energy tracking |
-| `Writer` / `Reader` | Positional agents that deposit/sample with radius |
-| `VibeSnapshot` | Immutable snapshot at a given tick |
-| `VibeFieldEngine` | Orchestrates multiple fields + writers/readers |
-| `FieldStats` | min, max, mean, std_dev, total_energy, entropy |
-
-## Writer/Reader pattern
+### Field-to-Field Transfer
 
 ```rust
-let mut engine = VibeFieldEngine::new(64, 64, 1.0);
+let mut source = VibeField::new(10, 10, 1.0);
+source.deposit(5, 5, 100.0);
+let sink = VibeField::new(10, 10, 1.0);
 
-// Writers deposit energy at positions
-engine.add_writer(Writer {
-    id: "source".into(),
-    position: (32, 32),
-    radius: 4,
-    strength: 50.0,
-});
+let mut pair = VibeFieldPair::new(source, sink);
+pair.transfer(5, 5, 8, 8, 30.0); // move 30 energy
 
-// Readers sample the field
-engine.add_reader(Reader {
-    id: "sensor".into(),
-    position: (48, 48),
-    radius: 2,
-});
-
-// Tick the engine
-let result = engine.tick();
+assert!(pair.is_conserved(100.0, 1e-10)); // combined energy unchanged
 ```
 
-## Presets
+---
+
+## API Reference
+
+### VibeField
+
+| Method | Description |
+|--------|-------------|
+| `new(width, height, resolution)` | Zeroed field |
+| `get(x, y)` / `set(x, y, value)` | Cell access (OOB returns 0.0 for get, no-op for set) |
+| `deposit(x, y, amount)` | Add energy (fails if OOB or negative) |
+| `withdraw(x, y, amount)` | Remove energy (fails if OOB, negative, or insufficient) |
+| `gradient(x, y)` | Central-difference gradient → `(∂f/∂x, ∂f/∂y)` |
+| `laplacian(x, y)` | Discrete Laplacian: `Σneighbors − 4·center` |
+| `divergence(x, y)` | Divergence of the gradient field |
+| `diffuse(rate)` | One heat equation step. Rate ∈ [0, 0.25] for stability. |
+| `advect(vx, vy, dt)` | Semi-Lagrangian advection by velocity fields |
+| `interpolate(x, y)` | Bilinear interpolation at continuous coordinates |
+| `resample(w, h)` | Resample to new grid size via bilinear interpolation |
+| `normalize()` | Scale so total energy = 1.0 |
+| `neighborhood(x, y, r)` | All cells within Euclidean radius `r` |
+| `local_maxima()` / `local_minima()` | Cells greater/less than all 8 neighbors |
+| `snapshot()` | Immutable `VibeSnapshot` |
+| `field_stats()` | `FieldStats` { min, max, mean, std_dev, total_energy, entropy } |
+| `is_conserved(expected, tol)` | Check energy invariant |
+| `total_energy()` | Incrementally tracked sum |
+
+### VibeFieldPair
+
+| Method | Description |
+|--------|-------------|
+| `new(source, sink)` | Two fields with conservation-preserving transfers |
+| `transfer(sx, sy, dx, dy, amount)` | Move energy from source to sink (atomic with rollback) |
+| `is_conserved(expected, tol)` | Check combined energy invariant |
+
+### VibeFieldEngine
+
+| Method | Description |
+|--------|-------------|
+| `new(diffusion_rate)` | Engine with global diffusion rate |
+| `create_field(name, w, h, res)` | Register a named field |
+| `deposit(field, x, y, amount)` | Deposit into a named field |
+| `withdraw(field, x, y, amount)` | Withdraw from a named field |
+| `tick()` | Diffuse all fields, advance tick counter |
+| `snapshot(field)` | Snapshot of a named field (with tick) |
+| `field_stats(field)` | Statistics for a named field |
+| `engine_stats()` | `EngineStats` { field_count, total_energy, tick } |
+
+### Writer / Reader
+
+Spatial agents that deposit/sample energy at positions with a radius:
 
 ```rust
-let small  = test_10x10();       // 10×10 test field
-let room   = room_64x64();       // Room-scale field
-let world  = world_256x256();    // World-scale field
+pub struct Writer { id, position, radius, strength }
+pub struct Reader { id, position, radius }
 ```
 
-## Contributing
+### Pre-built Fields
 
-PRs welcome. This crate is part of the [SuperInstance](https://github.com/SuperInstance) ecosystem. The field operations are deliberately minimal — if you need a new operation, open an issue first to discuss the math.
+| Function | Size | Description |
+|----------|------|-------------|
+| `test_10x10()` | 10×10 | Empty test field |
+| `room_64x64()` | 64×64 | 100 energy deposited at center (32, 32) |
+| `world_256x256()` | 256×256 | 25 energy at each of 4 corners |
+
+---
+
+## How It Works
+
+### Storage
+
+Flat `Vec<f64>` with row-major indexing: `data[y * width + x]`. Cache-friendly for row sweeps. Total energy is tracked incrementally — every `set`, `deposit`, and `withdraw` updates `total_energy` in O(1), so there's no need to recompute the sum.
+
+### Conservation
+
+- `deposit`: adds energy, increments total. Fails on OOB or negative amount.
+- `withdraw`: removes energy, decrements total. Fails on OOB, negative, or insufficient funds.
+- `set`: updates total by `new_value - old_value`.
+- `transfer` (in `VibeFieldPair`): atomic withdraw + deposit with rollback on failure.
+- `diffuse`: recomputes total from scratch after each step (diffusion can slightly violate conservation at boundaries).
+
+### Diffusion (Heat Equation)
+
+One explicit Euler step of the heat equation:
+
+$$u^{n+1}_{i,j} = u^n_{i,j} + r \cdot \nabla^2 u^n_{i,j}$$
+
+where $r$ = diffusion rate and $\nabla^2$ is the discrete Laplacian. Stability requires $r \leq 0.25$.
+
+### Advection (Semi-Lagrangian)
+
+For each grid cell $(x, y)$, trace backwards through the velocity field:
+
+$$\text{src}_x = x - \Delta t \cdot v_x(x, y), \quad \text{src}_y = y - \Delta t \cdot v_y(x, y)$$
+
+Sample the source position via bilinear interpolation. Unconditionally stable (Courant et al., 1952).
+
+### Gradient / Laplacian
+
+Central differences with boundary clamping (boundary gradients return 0.0):
+
+$$\frac{\partial f}{\partial x}\bigg|_{i,j} = \frac{f_{i+1,j} - f_{i-1,j}}{2}, \quad \nabla^2 f\big|_{i,j} = f_{i+1,j} + f_{i-1,j} + f_{i,j+1} + f_{i,j-1} - 4f_{i,j}$$
+
+### Entropy
+
+Shannon entropy over the probability distribution formed by normalizing cell values:
+
+$$H = -\sum_{i} p_i \ln p_i, \quad p_i = \frac{v_i}{\sum v_j}$$
+
+---
+
+## The Math
+
+### Energy Conservation Invariant
+
+$$\sum_{(x,y)} f(x, y) = E_{\text{total}}$$
+
+Maintained incrementally. After any sequence of deposits and withdrawals:
+
+```rust
+field.total_energy() == field.data.iter().sum()
+```
+
+### Diffusion Stability
+
+The explicit Euler scheme for the heat equation is stable when:
+
+$$r \leq \frac{1}{2d} = \frac{1}{4}$$
+
+for 2D. The API recommends `rate ∈ [0, 0.25]`.
+
+### Bilinear Interpolation
+
+$$f(x, y) \approx (1-\alpha)(1-\beta)f_{00} + \alpha(1-\beta)f_{10} + (1-\alpha)\beta f_{01} + \alpha\beta f_{11}$$
+
+where $\alpha = x - \lfloor x \rfloor$ and $\beta = y - \lfloor y \rfloor$.
+
+---
+
+## Test Coverage
+
+**57 tests** covering:
+
+- **Basics**: new (zeroed), set/get, set replaces, OOB returns 0
+- **Deposit/Withdraw**: basic, accumulates, OOB fails, negative fails, insufficient fails
+- **Gradient/Laplacian**: flat field (zero gradient), slope, boundary, peak Laplacian, boundary Laplacian
+- **Conservation**: is_conserved true/false, total matches sum
+- **Normalize**: basic, zero field (no panic)
+- **Diffusion**: spreads energy, multiple steps
+- **Neighborhood**: center, corner, radius 0
+- **Extrema**: single peak, flat (all maxima), single dip
+- **Interpolation**: on-grid, midpoint
+- **Resample**: same size, downsize
+- **Snapshot**: basic, gradient
+- **FieldStats**: basic, empty
+- **VibeFieldPair**: transfer, insufficient, conserved
+- **VibeFieldEngine**: create, deposit/withdraw, missing field, tick, stats, snapshot tick, snapshot missing
+- **Pre-built fields**: test_10x10, room_64x64, world_256x256
+- **Advection**: no velocity (identity), with velocity (shifts energy)
+- **Divergence**: flat field
+- **Serde**: field, snapshot, engine roundtrips
+
+```bash
+cargo test
+```
+
+---
+
+## License
+
+MIT
